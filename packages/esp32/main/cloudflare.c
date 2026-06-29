@@ -1,5 +1,4 @@
 #include "cloudflare.h"
-#include "esp_crt_bundle.h"
 #include "esp_err.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
@@ -9,72 +8,37 @@
 #include <stdio.h>
 #include <string.h>
 
-static const char *TAG = "cloudflare_stream";
+static const char *TAG = "cloudflare_poll";
 
-void cloudflare_stream_task(void *pvParameters) {
-  char url_buf[128];
-  snprintf(url_buf, sizeof(url_buf), "http://%s/stream", WOL_HOST);
+extern const char cloudflare_root_ca_pem_start[]
+    asm("_binary_cloudflare_root_ca_pem_start");
+extern const char cloudflare_root_ca_pem_end[]
+    asm("_binary_cloudflare_root_ca_pem_end");
 
-  esp_http_client_config_t config = {
-      .url = url_buf,
-      .event_handler = http_stream_event_handler,
-      .is_async = false,
-      .timeout_ms = 60000,
-      .skip_cert_common_name_check = true,
-      .crt_bundle_attach = NULL,
-  };
+#define POLL_INTERVAL_MS 60000
+#define RESPONSE_BUF_SIZE 256
 
-  esp_http_client_handle_t client = esp_http_client_init(&config);
+typedef struct {
+  char buffer[RESPONSE_BUF_SIZE];
+  int offset;
+} response_buf_t;
 
-  esp_http_client_set_header(client, "X-WOL-Secret", WOL_SECRET);
-  esp_http_client_set_header(client, "Accept", "text/event-stream");
-  esp_http_client_set_header(client, "Connection", "keep-alive");
+static esp_err_t poll_event_handler(esp_http_client_event_t *evt) {
+  response_buf_t *resp = (response_buf_t *)evt->user_data;
+  if (resp == NULL)
+    return ESP_OK;
 
-  while (1) {
-    ESP_LOGI(TAG, "Connecting to Cloudflare push stream: %s", url_buf);
-
-    esp_err_t err = esp_http_client_perform(client);
-
-    if (err == ESP_OK) {
-      ESP_LOGI(TAG, "HTTP Stream ended gracefully or timed out.");
-    } else {
-      ESP_LOGE(TAG, "HTTP Stream connection failed: %s", esp_err_to_name(err));
-    }
-
-    ESP_LOGI(TAG, "Retrying stream connection in 10 seconds...");
-    vTaskDelay(pdMS_TO_TICKS(10000));
-  }
-
-  esp_http_client_cleanup(client);
-  vTaskDelete(NULL);
-}
-
-static esp_err_t http_stream_event_handler(esp_http_client_event_t *evt) {
   switch (evt->event_id) {
   case HTTP_EVENT_ON_DATA:
-    if (evt->data_len < 0)
-      break;
-
-    size_t chunk_size = evt->data_len;
-
-    char *chunk = (char *)malloc(chunk_size + 1);
-    if (chunk == NULL)
-      return ESP_ERR_NO_MEM;
-
-    memcpy(chunk, evt->data, chunk_size);
-
-    chunk[chunk_size] = '\0';
-
-    ESP_LOGD(TAG, "Received stream data: %s", chunk);
-
-    handle_cloudflare_operation(chunk);
-    free(chunk);
-    break;
-  case HTTP_EVENT_DISCONNECTED:
-    ESP_LOGE(TAG, "HTTP Stream disconnected");
-    break;
-  case HTTP_EVENT_ERROR:
-    ESP_LOGE(TAG, "HTTP Stream experienced an error");
+    if (evt->data_len > 0) {
+      int remaining = RESPONSE_BUF_SIZE - resp->offset - 1;
+      int to_copy = evt->data_len < remaining ? evt->data_len : remaining;
+      if (to_copy > 0) {
+        memcpy(resp->buffer + resp->offset, evt->data, to_copy);
+        resp->offset += to_copy;
+        resp->buffer[resp->offset] = '\0';
+      }
+    }
     break;
   default:
     break;
@@ -82,15 +46,56 @@ static esp_err_t http_stream_event_handler(esp_http_client_event_t *evt) {
   return ESP_OK;
 }
 
-void handle_cloudflare_operation(const char *operation) {
-  if (strcmp(operation, OPERATION_HANDSHAKE) == 0) {
-    ESP_LOGI(TAG, "Successfully connected to the cloudflare event stream");
-  } else if (strcmp(operation, OPERATION_WAKE)) {
-    ESP_LOGI(TAG, "Got wake operation, proceeding with WOL...");
-    send_wol_packet(TARGET_MAC);
-  } else {
-    ESP_LOGW(TAG, "Unknown operation received: %s", operation);
+void cloudflare_stream_task(void *pvParameters) {
+  char url_buf[128];
+  snprintf(url_buf, sizeof(url_buf), "https://%s/poll", WOL_HOST);
+
+  response_buf_t resp = {0};
+
+  esp_http_client_config_t config = {
+      .url = url_buf,
+      .event_handler = poll_event_handler,
+      .user_data = &resp,
+      .cert_pem = cloudflare_root_ca_pem_start,
+      .transport_type = HTTP_TRANSPORT_OVER_SSL,
+      .timeout_ms = 10000,
+  };
+
+  esp_http_client_handle_t client = esp_http_client_init(&config);
+  if (client == NULL) {
+    ESP_LOGE(TAG, "Failed to initialize HTTP client");
+    vTaskDelete(NULL);
+    return;
   }
+
+  esp_http_client_set_header(client, "X-WOL-Secret", WOL_SECRET);
+
+  ESP_LOGI(TAG, "Starting poll loop against %s", url_buf);
+
+  while (1) {
+    resp.offset = 0;
+    resp.buffer[0] = '\0';
+
+    esp_err_t err = esp_http_client_perform(client);
+    if (err == ESP_OK) {
+      int status = esp_http_client_get_status_code(client);
+      if (status == 200) {
+        if (strstr(resp.buffer, "\"WAKE\"") != NULL) {
+          ESP_LOGI(TAG, "Got wake operation, proceeding with WOL...");
+          send_wol_packet(TARGET_MAC);
+        }
+      } else {
+        ESP_LOGE(TAG, "Poll returned HTTP %d", status);
+      }
+    } else {
+      ESP_LOGE(TAG, "Poll request failed: %s", esp_err_to_name(err));
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(POLL_INTERVAL_MS));
+  }
+
+  esp_http_client_cleanup(client);
+  vTaskDelete(NULL);
 }
 
 void convert_mac_string_to_uint(const char *mac_str, uint8_t *mac_array) {
@@ -119,7 +124,7 @@ void send_wol_packet(const char *mac_address) {
   }
 
   uint8_t target_mac[6];
-  convert_mac_string_to_uint(TARGET_MAC, target_mac);
+  convert_mac_string_to_uint(mac_address, target_mac);
   for (int j = 0; j < 16; j++) {
     for (int k = 0; k < 6; k++) {
       wol_packet[packet_index++] = target_mac[k];

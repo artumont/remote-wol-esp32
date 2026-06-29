@@ -1,5 +1,6 @@
 idf_component_register(SRCS "main.c" "cloudflare.c"
-                    INCLUDE_DIRS ".")
+                    INCLUDE_DIRS "."
+                    EMBED_TXTFILES "cloudflare_root_ca.pem")
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../.env")
     file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/../.env" CONFIG_LINES)

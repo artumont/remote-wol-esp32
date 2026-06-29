@@ -1,6 +1,7 @@
 #include "cloudflare.h"
 #include "esp_event_base.h"
 #include "esp_log.h"
+#include "esp_netif_sntp.h"
 #include "esp_netif_types.h"
 #include "esp_wifi.h"
 #include "esp_wifi_types_generic.h"
@@ -10,6 +11,15 @@
 static const char *TAG = "main_loop";
 static int s_retry_num = 0;
 #define MAXIMUM_RETRY 5
+
+void sync_time(void) {
+  esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+  esp_netif_sntp_init(&config);
+
+  ESP_LOGI(TAG, "Waiting for NTP sync...");
+  esp_netif_sntp_sync_wait(pdMS_TO_TICKS(10000));
+  esp_netif_sntp_deinit();
+}
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data) {
@@ -27,8 +37,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
   } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
     ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
     s_retry_num = 0;
-    ESP_LOGI(TAG, "Successfully connected to the AP on ip: %s", IPSTR,
+    ESP_LOGI(TAG, "Successfully connected to the AP on IP: ", IPSTR,
              IP2STR(&event->ip_info.ip));
+
+    sync_time();
 
     xTaskCreate(cloudflare_stream_task, "CloudflareStreamTask", 8192, NULL, 1,
                 NULL);
