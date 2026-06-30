@@ -1,4 +1,3 @@
-#include "cloudflare.h"
 #include "esp_event_base.h"
 #include "esp_log.h"
 #include "esp_netif_sntp.h"
@@ -19,6 +18,7 @@ void sync_time(void) {
   ESP_LOGI(TAG, "Waiting for NTP sync...");
   esp_netif_sntp_sync_wait(pdMS_TO_TICKS(10000));
   esp_netif_sntp_deinit();
+  ESP_LOGI(TAG, "NTP synced successfully");
 }
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
@@ -35,15 +35,11 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
       ESP_LOGE(TAG, "Failed to connect to the AP maximum retries exceeded");
     }
   } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-    ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
     s_retry_num = 0;
-    ESP_LOGI(TAG, "Successfully connected to the AP on IP: ", IPSTR,
-             IP2STR(&event->ip_info.ip));
+    ESP_LOGI(TAG, "Successfully connected to the AP");
 
     sync_time();
-
-    xTaskCreate(cloudflare_stream_task, "CloudflareStreamTask", 8192, NULL, 1,
-                NULL);
+    // xTaskCreate();
   }
 }
 
@@ -80,7 +76,7 @@ void wifi_init_sta(void) {
 
   ESP_ERROR_CHECK(esp_wifi_start());
 
-  ESP_LOGI(TAG, "Wi-Fi initialization station complete. Connecting...");
+  ESP_LOGI(TAG, "Wi-Fi initialization complete. Connecting...");
 }
 
 void app_main(void) {
